@@ -5,12 +5,14 @@ import re
 import hashlib
 import sqlite3
 from datetime import datetime, timedelta
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ChatPermissions
 from aiogram.enums import ChatType, ChatMemberStatus
 from aiogram.filters import Command, CommandObject
 from aiogram.exceptions import TelegramBadRequest
+
 TOKEN = os.getenv("BOT_TOKEN")
 DB_NAME = "bot_data.db"
 ADMIN_USERNAME = "@Iamthebestperson14"
@@ -170,6 +172,7 @@ async def cmd_start(message: Message):
         f"🙋‍♂️ По любым вопросам обращаться: {ADMIN_USERNAME}"
     )
     await message.answer(help_text)
+
 @dp.message(Command("me"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def cmd_profile(message: Message):
     user_id, chat_id = message.from_user.id, message.chat.id
@@ -324,7 +327,20 @@ async def main_chat_handler(message: Message):
     if text and any(re.search(p, text.lower()) for p in SPAM_PATTERNS):
         await punish_user_dynamic(message, cid, uid, "links / spam")
 
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+
 async def main():
+    await start_web_server()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
