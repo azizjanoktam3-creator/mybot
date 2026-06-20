@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ChatPermissions
+from aiogram.types import Message, ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.enums import ChatType, ChatMemberStatus
 from aiogram.filters import Command, CommandObject
 from aiogram.exceptions import TelegramBadRequest
@@ -67,7 +67,6 @@ def init_db():
     conn.close()
 init_db()
 
-
 @dp.message(Command("add"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def add_to_kick_list(message: Message):
     if message.reply_to_message:
@@ -79,34 +78,53 @@ async def add_to_kick_list(message: Message):
         conn.close()
         await message.reply(f"Пользователь {message.reply_to_message.from_user.full_name} добавлен в очередь на кик.")
 
-
 @dp.message(Command("k"), F.chat.type == ChatType.PRIVATE)
-async def cmd_kick_all(message: Message):
+async def cmd_kick_menu(message: Message):
     if message.from_user.id != MY_ID:
         return 
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT chat_id, user_id FROM target_users")
-    users_to_kick = cursor.fetchall()
+    users = cursor.fetchall()
+    conn.close()
     
-    if not users_to_kick:
+    if not users:
         await message.answer("Список пуст.")
         return
 
-    count = 0
-    for chat_id, user_id in users_to_kick:
+    buttons = []
+    for chat_id, user_id in users:
         try:
-            await bot.ban_chat_member(chat_id, user_id)
-            await bot.unban_chat_member(chat_id, user_id)
-            count += 1
-        except Exception as e:
-            logging.error(f"Ошибка при кике {user_id}: {e}")
-            
-    cursor.execute("DELETE FROM target_users")
-    conn.commit()
-    conn.close()
-    await message.answer(f"Успешно кикнуто {count} пользователей.")
+            member = await bot.get_chat_member(chat_id, user_id)
+            name = member.user.full_name
+        except:
+            name = f"ID: {user_id}"
+        
+        callback_data = f"kick_{chat_id}_{user_id}"
+        buttons.append([InlineKeyboardButton(text=f"Кикнуть: {name}", callback_data=callback_data)])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer("Выберите пользователя для кика:", reply_markup=keyboard)
+
+@dp.callback_query(F.data.startswith("kick_"))
+async def process_kick_callback(callback: CallbackQuery):
+    _, chat_id, user_id = callback.data.split("_")
+    chat_id, user_id = int(chat_id), int(user_id)
+
+    try:
+        await bot.ban_chat_member(chat_id, user_id)
+        await bot.unban_chat_member(chat_id, user_id)
+        
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM target_users WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+        conn.commit()
+        conn.close()
+        
+        await callback.message.edit_text(f"✅ Пользователь {user_id} был успешно кикнут.")
+    except Exception as e:
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
 
 def save_message(chat_id, user_id, username, full_name, text):
     conn = sqlite3.connect(DB_NAME)
@@ -218,7 +236,7 @@ async def cmd_start(message: Message):
         "• /warn — Выдать предупреждение вручную (использовать как ответ на сообщение нарушителя).\n"
         "• /clean [число] — Быстро очистить указанное количество сообщений.\n"
         "• /clean @username [число] — Очистить сообщения конкретного нарушителя.\n"
-        "• /add — Добавить пользователя в список на кик (при ответе на сообщение).\n\n"
+        
         f"🙋‍♂️ По любым вопросам обращаться: {ADMIN_USERNAME}"
     )
     await message.answer(help_text)
@@ -278,13 +296,6 @@ async def cmd_find_message(message: Message, command: CommandObject):
 
 @dp.message(Command("warn"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def cmd_warn(message: Message):
-    try:
-        m = await bot.get_chat_member(message.chat.id, message.from_user.id)
-        if m.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
-            await message.reply("Доступно только админам.")
-            return
-    except:
-        return
     if not message.reply_to_message:
         await message.reply("Ответьте на сообщение нарушителя.")
         return
@@ -292,21 +303,12 @@ async def cmd_warn(message: Message):
 
 @dp.message(Command("clean"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def cmd_clean(message: Message, command: CommandObject):
-    try:
-        m = await bot.get_chat_member(message.chat.id, message.from_user.id)
-        if m.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
-            await message.reply("Доступно только админам.")
-            return
-    except:
-        return
     args = command.args
     count = 10
     if args:
         parts = args.split()
-        if len(parts) == 1 and parts[0].isdigit():
-            count = int(parts[0])
-        elif len(parts) == 2 and parts[0].startswith("@") and parts[1].isdigit():
-            count = int(parts[1])
+        if len(parts) == 1 and parts[0].isdigit(): count = int(parts[0])
+        elif len(parts) == 2 and parts[0].startswith("@") and parts[1].isdigit(): count = int(parts[1])
     count = min(max(count, 1), 100)
     start_id = message.message_id
     deleted = 0
@@ -315,8 +317,7 @@ async def cmd_clean(message: Message, command: CommandObject):
         try:
             await bot.delete_message(chat_id=message.chat.id, message_id=start_id - i)
             if i > 0: deleted += 1
-        except:
-            continue
+        except: continue
     info = await message.answer(f"Удалено сообщений: {deleted}")
     await asyncio.sleep(3)
     try: await info.delete()
@@ -331,10 +332,9 @@ async def main_chat_handler(message: Message):
     if text and not text.startswith("/"):
         save_message(cid, uid, message.from_user.username or "", message.from_user.full_name, text)
         lvl = track_user(cid, uid)
-        if lvl:
-            await message.reply(f"Поздравляем! {message.from_user.full_name} поднял уровень до {lvl}!")
+        if lvl: await message.reply(f"Поздравляем! {message.from_user.full_name} поднял уровень до {lvl}!")
 
-    if message.reply_to_message and text.strip() in ["+", "rahmat", "raxmat", "Thanks", "спасибо", "Спасибо"]:
+    if message.reply_to_message and text.strip() in ["+", "raxmat", "Thanks", "спасибо", "Спасибо"]:
         if message.reply_to_message.from_user.id == uid:
             await message.reply("Нельзя повышать репутацию себе! 😅")
             return
@@ -346,47 +346,11 @@ async def main_chat_handler(message: Message):
         await message.reply(f"Репутация {message.reply_to_message.from_user.first_name} повышена!")
         return
 
-    try:
-        m = await bot.get_chat_member(cid, uid)
-        if m.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]: return
-    except:
-        return
-
-    if text and len(text) > 5:
-        letters = re.sub(r'[^a-zA-Zа-яА-ЯёЁ]', '', text)
-        if letters and letters.isupper():
-            await punish_user_dynamic(message, cid, uid, "caps lock")
-            return
-
-    c_hash = None
-    if message.text:
-        c_hash = hashlib.md5(text.strip().lower().encode('utf-8')).hexdigest()
-    elif message.animation:
-        c_hash = f"gif_{message.animation.file_unique_id}"
-
-    if c_hash:
-        user_key = (cid, uid)
-        current_time = datetime.now()
-        if user_key in last_messages:
-            prev_hash, prev_time = last_messages[user_key]
-            if prev_hash == c_hash and (current_time - prev_time).total_seconds() < 10:
-                await punish_user_dynamic(message, cid, uid, "flood (retry < 10 sec)")
-                return
-        last_messages[user_key] = (c_hash, current_time)
-
-    if text and any(re.search(p, text.lower()) for p in SPAM_PATTERNS):
-        await punish_user_dynamic(message, cid, uid, "links / spam")
-
-async def handle(request):
-    return web.Response(text="Bot is running!")
-
 async def start_web_server():
     app = web.Application()
-    app.router.add_get('/', handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
+    site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 8080)))
     await site.start()
 
 async def main():
