@@ -16,6 +16,7 @@ from aiogram.exceptions import TelegramBadRequest
 TOKEN = os.getenv("BOT_TOKEN")
 DB_NAME = "bot_data.db"
 ADMIN_USERNAME = "@Iamthebestperson14"
+MY_ID = 8130397177
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
@@ -55,9 +56,57 @@ def init_db():
             PRIMARY KEY (chat_id, user_id)
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS target_users (
+            chat_id INTEGER,
+            user_id INTEGER,
+            PRIMARY KEY (chat_id, user_id)
+        )
+    """)
     conn.commit()
     conn.close()
 init_db()
+
+
+@dp.message(Command("add"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def add_to_kick_list(message: Message):
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO target_users (chat_id, user_id) VALUES (?, ?)", (message.chat.id, target_id))
+        conn.commit()
+        conn.close()
+        await message.reply(f"Пользователь {message.reply_to_message.from_user.full_name} добавлен в очередь на кик.")
+
+
+@dp.message(Command("k"), F.chat.type == ChatType.PRIVATE)
+async def cmd_kick_all(message: Message):
+    if message.from_user.id != MY_ID:
+        return 
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT chat_id, user_id FROM target_users")
+    users_to_kick = cursor.fetchall()
+    
+    if not users_to_kick:
+        await message.answer("Список пуст.")
+        return
+
+    count = 0
+    for chat_id, user_id in users_to_kick:
+        try:
+            await bot.ban_chat_member(chat_id, user_id)
+            await bot.unban_chat_member(chat_id, user_id)
+            count += 1
+        except Exception as e:
+            logging.error(f"Ошибка при кике {user_id}: {e}")
+            
+    cursor.execute("DELETE FROM target_users")
+    conn.commit()
+    conn.close()
+    await message.answer(f"Успешно кикнуто {count} пользователей.")
 
 def save_message(chat_id, user_id, username, full_name, text):
     conn = sqlite3.connect(DB_NAME)
@@ -168,7 +217,8 @@ async def cmd_start(message: Message):
         "⚙️ Команды для Администраторов:\n"
         "• /warn — Выдать предупреждение вручную (использовать как ответ на сообщение нарушителя).\n"
         "• /clean [число] — Быстро очистить указанное количество сообщений.\n"
-        "• /clean @username [число] — Очистить сообщения конкретного нарушителя.\n\n"
+        "• /clean @username [число] — Очистить сообщения конкретного нарушителя.\n"
+        "• /add — Добавить пользователя в список на кик (при ответе на сообщение).\n\n"
         f"🙋‍♂️ По любым вопросам обращаться: {ADMIN_USERNAME}"
     )
     await message.answer(help_text)
