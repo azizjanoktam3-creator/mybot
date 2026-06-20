@@ -3,7 +3,7 @@ import asyncio
 import logging
 import re
 import hashlib
-import sqlite3
+import asyncpg
 from datetime import datetime, timedelta
 from aiohttp import web
 
@@ -14,7 +14,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.exceptions import TelegramBadRequest
 
 TOKEN = os.getenv("BOT_TOKEN")
-DB_NAME = "bot_data.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_USERNAME = "@Iamthebestperson14"
 
 logging.basicConfig(level=logging.INFO)
@@ -29,126 +29,100 @@ SPAM_PATTERNS = [
     r"@\w+"
 ]
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
+async def init_db():
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER, user_id INTEGER, username TEXT,
-            full_name TEXT, text TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT, user_id BIGINT, username TEXT,
+            full_name TEXT, text TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    cursor.execute("""
+    await conn.execute("""
         CREATE TABLE IF NOT EXISTS user_stats (
-            chat_id INTEGER, user_id INTEGER,
-            joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            chat_id BIGINT, user_id BIGINT,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             warn_count INTEGER DEFAULT 0, mute_count INTEGER DEFAULT 0,
             reputation INTEGER DEFAULT 0, xp INTEGER DEFAULT 0, level INTEGER DEFAULT 1,
             PRIMARY KEY (chat_id, user_id)
         )
     """)
-    cursor.execute("""
+    await conn.execute("""
         CREATE TABLE IF NOT EXISTS user_last_seen (
-            chat_id INTEGER, user_id INTEGER,
-            last_seen_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+            chat_id BIGINT, user_id BIGINT,
+            last_seen_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (chat_id, user_id)
         )
     """)
-    conn.commit()
-    conn.close()
-init_db()
+    await conn.close()
 
-def save_message(chat_id, user_id, username, full_name, text):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO messages (chat_id, user_id, username, full_name, text) VALUES (?, ?, ?, ?, ?)",
-        (chat_id, user_id, username, full_name, text)
+async def save_message(chat_id, user_id, username, full_name, text):
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute(
+        "INSERT INTO messages (chat_id, user_id, username, full_name, text) VALUES ($1, $2, $3, $4, $5)",
+        chat_id, user_id, username, full_name, text
     )
-    conn.commit()
-    conn.close()
+    await conn.close()
 
-def track_user(chat_id, user_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO user_stats (chat_id, user_id) VALUES (?, ?)
-        ON CONFLICT(chat_id, user_id) DO UPDATE SET xp = xp + 1
-    """, (chat_id, user_id))
-    cursor.execute("SELECT xp, level FROM user_stats WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-    result = cursor.fetchone()
+async def track_user(chat_id, user_id):
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("""
+        INSERT INTO user_stats (chat_id, user_id, xp) VALUES ($1, $2, 1)
+        ON CONFLICT(chat_id, user_id) DO UPDATE SET xp = user_stats.xp + 1
+    """, chat_id, user_id)
+    result = await conn.fetchrow("SELECT xp, level FROM user_stats WHERE chat_id = $1 AND user_id = $2", chat_id, user_id)
     if not result:
-        conn.close()
+        await conn.close()
         return None
-    xp, level = result
+    xp, level = result['xp'], result['level']
     next_level_xp = level * 20
     if xp >= next_level_xp:
         new_level = level + 1
-        cursor.execute("UPDATE user_stats SET level = ?, xp = 0 WHERE chat_id = ? AND user_id = ?", (new_level, chat_id, user_id))
-        conn.commit()
-        conn.close()
+        await conn.execute("UPDATE user_stats SET level = $1, xp = 0 WHERE chat_id = $2 AND user_id = $3", new_level, chat_id, user_id)
+        await conn.close()
         return new_level
-    conn.commit()
-    conn.close()
+    await conn.close()
     return None
 
-def get_full_profile(chat_id, user_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-    msg_count = cursor.fetchone()[0]
-    cursor.execute("SELECT max(timestamp) FROM messages WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-    last_active = cursor.fetchone()[0]
-    cursor.execute("""
-        SELECT joined_at, warn_count, mute_count, reputation, level, xp 
-        FROM user_stats WHERE chat_id = ? AND user_id = ?
-    """, (chat_id, user_id))
-    stats = cursor.fetchone()
-    conn.close()
-    if not stats:
-        return msg_count, last_active, "Unknown", 0, 0, 0, 1, 0
-    return (msg_count, last_active) + stats
+async def get_full_profile(chat_id, user_id):
+    conn = await asyncpg.connect(DATABASE_URL)
+    msg_count = await conn.fetchval("SELECT COUNT(*) FROM messages WHERE chat_id = $1 AND user_id = $2", chat_id, user_id)
+    last_active = await conn.fetchval("SELECT max(timestamp) FROM messages WHERE chat_id = $1 AND user_id = $2", chat_id, user_id)
+    stats = await conn.fetchrow("SELECT joined_at, warn_count, mute_count, reputation, level, xp FROM user_stats WHERE chat_id = $1 AND user_id = $2", chat_id, user_id)
+    await conn.close()
+    if not stats: return msg_count, last_active, "Unknown", 0, 0, 0, 1, 0
+    return (msg_count, last_active, stats['joined_at'], stats['warn_count'], stats['mute_count'], stats['reputation'], stats['level'], stats['xp'])
 
 async def punish_user_dynamic(message: Message, chat_id: int, user_id: int, reason: str, is_warn_command=False):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT warn_count, mute_count FROM user_stats WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-    row = cursor.fetchone()
+    conn = await asyncpg.connect(DATABASE_URL)
+    row = await conn.fetchrow("SELECT warn_count, mute_count FROM user_stats WHERE chat_id = $1 AND user_id = $2", chat_id, user_id)
     if not row:
-        cursor.execute("INSERT INTO user_stats (chat_id, user_id, warn_count) VALUES (?, ?, 1)", (chat_id, user_id))
+        await conn.execute("INSERT INTO user_stats (chat_id, user_id, warn_count) VALUES ($1, $2, 1)", chat_id, user_id)
         warns, mutes = 1, 0
     else:
-        warns = row[0] + 1
-        mutes = row[1]
-        cursor.execute("UPDATE user_stats SET warn_count = ? WHERE chat_id = ? AND user_id = ?", (warns, chat_id, user_id))
-    conn.commit()
-    conn.close()
+        warns, mutes = row['warn_count'] + 1, row['mute_count']
+        await conn.execute("UPDATE user_stats SET warn_count = $1 WHERE chat_id = $2 AND user_id = $3", warns, chat_id, user_id)
+    await conn.close()
 
     if not is_warn_command:
-        try:
-            await message.delete()
-        except TelegramBadRequest:
-            pass
+        try: await message.delete()
+        except TelegramBadRequest: pass
 
     if warns < 3:
         alert = f"!! {message.from_user.full_name}, {reason}! Preduprezhdenie ({warns}/3)"
         await message.answer(alert)
     else:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
+        conn = await asyncpg.connect(DATABASE_URL)
         new_mutes = mutes + 1
-        cursor.execute("UPDATE user_stats SET warn_count = 0, mute_count = ? WHERE chat_id = ? AND user_id = ?", (new_mutes, chat_id, user_id))
-        conn.commit()
-        conn.close()
+        await conn.execute("UPDATE user_stats SET warn_count = 0, mute_count = $1 WHERE chat_id = $2 AND user_id = $3", new_mutes, chat_id, user_id)
+        await conn.close()
         minutes = min(new_mutes * 15, 45)
         until_date = datetime.now() + timedelta(minutes=minutes)
         permissions = ChatPermissions(can_send_messages=False, can_send_media_messages=False, can_send_other_messages=False)
         try:
             await bot.restrict_chat_member(chat_id=chat_id, user_id=user_id, permissions=permissions, until_date=until_date)
             await message.answer(f"// {message.from_user.full_name} v mute na {minutes} min. Prichina: {reason}")
-        except Exception as e:
-            logging.error(f"Error mute: {e}")
+        except Exception as e: logging.error(f"Error mute: {e}")
 
 @dp.message(Command("start"), F.chat.type == ChatType.PRIVATE)
 async def cmd_start(message: Message):
@@ -173,10 +147,16 @@ async def cmd_start(message: Message):
     )
     await message.answer(help_text)
 
+@dp.message(Command("k"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def cmd_kick_all(message: Message):
+    m = await bot.get_chat_member(message.chat.id, message.from_user.id)
+    if m.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]: return
+    await message.answer("⚠️ Кикаю всех участников...")
+
 @dp.message(Command("me"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def cmd_profile(message: Message):
     user_id, chat_id = message.from_user.id, message.chat.id
-    msg_count, last_active, joined_at, warns, mutes, rep, level, xp = get_full_profile(chat_id, user_id)
+    msg_count, last_active, joined_at, warns, mutes, rep, level, xp = await get_full_profile(chat_id, user_id)
     profile_text = (
         f"--- КАРТОЧКА УЧАСТНИКА: {message.from_user.full_name} ---\n\n"
         f"Вход в чат: {joined_at}\n"
@@ -189,22 +169,20 @@ async def cmd_profile(message: Message):
 
 @dp.message(Command("top"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def cmd_top(message: Message):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, level, reputation FROM user_stats WHERE chat_id = ? ORDER BY level DESC, reputation DESC LIMIT 10", (message.chat.id,))
-    rows = cursor.fetchall()
-    conn.close()
+    conn = await asyncpg.connect(DATABASE_URL)
+    rows = await conn.fetch("SELECT user_id, level, reputation FROM user_stats WHERE chat_id = $1 ORDER BY level DESC, reputation DESC LIMIT 10", message.chat.id)
+    await conn.close()
     if not rows:
         await message.reply("В этом чате пока нет активных участников.")
         return
     top_text = "--- ТОП-10 УЧАСТНИКОВ ЧАТА ---\n\n"
     for idx, row in enumerate(rows, start=1):
         try:
-            member = await bot.get_chat_member(message.chat.id, row[0])
+            member = await bot.get_chat_member(message.chat.id, row['user_id'])
             name = member.user.first_name
         except:
-            name = f"ID: {row[0]}"
-        top_text += f"{idx}. {name} - Лвл: {row[1]}, Реп: {row[2]}\n"
+            name = f"ID: {row['user_id']}"
+        top_text += f"{idx}. {name} - Лвл: {row['level']}, Реп: {row['reputation']}\n"
     await message.answer(top_text)
 
 @dp.message(Command("find", "myfind"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
@@ -213,17 +191,15 @@ async def cmd_find_message(message: Message, command: CommandObject):
     if not query:
         await message.reply("Пример использования: /find привет")
         return
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT text, timestamp FROM messages WHERE chat_id = ? AND user_id = ? AND text LIKE ? ORDER BY timestamp DESC LIMIT 5", (message.chat.id, message.from_user.id, f"%{query}%"))
-    rows = cursor.fetchall()
-    conn.close()
+    conn = await asyncpg.connect(DATABASE_URL)
+    rows = await conn.fetch("SELECT text, timestamp FROM messages WHERE chat_id = $1 AND user_id = $2 AND text LIKE $3 ORDER BY timestamp DESC LIMIT 5", message.chat.id, message.from_user.id, f"%{query}%")
+    await conn.close()
     if not rows:
         await message.reply("Ничего не найдено.")
         return
     res = f"Результаты по запросу \"{query}\":\n\n"
     for idx, row in enumerate(rows, start=1):
-        res += f"{idx}. [{row[1]}] - \"{row[0]}\"\n"
+        res += f"{idx}. [{row['timestamp']}] - \"{row['text']}\"\n"
     await message.answer(res)
 
 @dp.message(Command("warn"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
@@ -233,8 +209,7 @@ async def cmd_warn(message: Message):
         if m.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
             await message.reply("Доступно только админам.")
             return
-    except:
-        return
+    except: return
     if not message.reply_to_message:
         await message.reply("Ответьте на сообщение нарушителя.")
         return
@@ -247,16 +222,13 @@ async def cmd_clean(message: Message, command: CommandObject):
         if m.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
             await message.reply("Доступно только админам.")
             return
-    except:
-        return
+    except: return
     args = command.args
     count = 10
     if args:
         parts = args.split()
-        if len(parts) == 1 and parts[0].isdigit():
-            count = int(parts[0])
-        elif len(parts) == 2 and parts[0].startswith("@") and parts[1].isdigit():
-            count = int(parts[1])
+        if len(parts) == 1 and parts[0].isdigit(): count = int(parts[0])
+        elif len(parts) == 2 and parts[0].startswith("@") and parts[1].isdigit(): count = int(parts[1])
     count = min(max(count, 1), 100)
     start_id = message.message_id
     deleted = 0
@@ -265,8 +237,7 @@ async def cmd_clean(message: Message, command: CommandObject):
         try:
             await bot.delete_message(chat_id=message.chat.id, message_id=start_id - i)
             if i > 0: deleted += 1
-        except:
-            continue
+        except: continue
     info = await message.answer(f"Удалено сообщений: {deleted}")
     await asyncio.sleep(3)
     try: await info.delete()
@@ -279,28 +250,24 @@ async def main_chat_handler(message: Message):
     text = message.text or message.caption or ""
 
     if text and not text.startswith("/"):
-        save_message(cid, uid, message.from_user.username or "", message.from_user.full_name, text)
-        lvl = track_user(cid, uid)
-        if lvl:
-            await message.reply(f"Поздравляем! {message.from_user.full_name} поднял уровень до {lvl}!")
+        await save_message(cid, uid, message.from_user.username or "", message.from_user.full_name, text)
+        lvl = await track_user(cid, uid)
+        if lvl: await message.reply(f"Поздравляем! {message.from_user.full_name} поднял уровень до {lvl}!")
 
     if message.reply_to_message and text.strip() in ["+", "rahmat", "raxmat", "Thanks", "спасибо", "Спасибо"]:
         if message.reply_to_message.from_user.id == uid:
             await message.reply("Нельзя повышать репутацию себе! 😅")
             return
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO user_stats (chat_id, user_id, reputation) VALUES (?, ?, 1) ON CONFLICT(chat_id, user_id) DO UPDATE SET reputation = reputation + 1", (cid, message.reply_to_message.from_user.id))
-        conn.commit()
-        conn.close()
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute("INSERT INTO user_stats (chat_id, user_id, reputation) VALUES ($1, $2, 1) ON CONFLICT(chat_id, user_id) DO UPDATE SET reputation = reputation + 1", cid, message.reply_to_message.from_user.id)
+        await conn.close()
         await message.reply(f"Репутация {message.reply_to_message.from_user.first_name} повышена!")
         return
 
     try:
         m = await bot.get_chat_member(cid, uid)
         if m.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]: return
-    except:
-        return
+    except: return
 
     if text and len(text) > 5:
         letters = re.sub(r'[^a-zA-Zа-яА-ЯёЁ]', '', text)
@@ -309,10 +276,8 @@ async def main_chat_handler(message: Message):
             return
 
     c_hash = None
-    if message.text:
-        c_hash = hashlib.md5(text.strip().lower().encode('utf-8')).hexdigest()
-    elif message.animation:
-        c_hash = f"gif_{message.animation.file_unique_id}"
+    if message.text: c_hash = hashlib.md5(text.strip().lower().encode('utf-8')).hexdigest()
+    elif message.animation: c_hash = f"gif_{message.animation.file_unique_id}"
 
     if c_hash:
         user_key = (cid, uid)
@@ -327,19 +292,15 @@ async def main_chat_handler(message: Message):
     if text and any(re.search(p, text.lower()) for p in SPAM_PATTERNS):
         await punish_user_dynamic(message, cid, uid, "links / spam")
 
-async def handle(request):
-    return web.Response(text="Bot is running!")
-
 async def start_web_server():
     app = web.Application()
-    app.router.add_get('/', handle)
+    app.router.add_get('/', lambda r: web.Response(text="Bot is running!"))
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
+    await web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 8080))).start()
 
 async def main():
+    await init_db()
     await start_web_server()
     await dp.start_polling(bot)
 
