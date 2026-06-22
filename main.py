@@ -346,8 +346,12 @@ async def main_chat_handler(message: Message):
         await message.reply(f"Репутация {message.reply_to_message.from_user.first_name} повышена!")
         return
 
+async def handle_root(request):
+    return web.Response(text="Bot is running and healthy!")
+
 async def start_web_server():
     app = web.Application()
+    app.router.add_get('/', handle_root)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 8080)))
